@@ -319,7 +319,7 @@ static Buttons ReadButtons() {
 
 // Feature switches. Every feature only changes your own game.
 static bool f_velocityFly, f_ironMan, f_tpGun, f_noclip, f_speedBoost, f_noGravity;
-static bool f_itemGun, f_spawnOnHand, f_car;
+static bool f_itemGun, f_spawnOnHand, f_car, f_arrows;
 static char g_itemKey[64] = "";                // the last item you held (learned on grab)
 struct PendingItem { Vector3 pos, vel; };
 static std::vector<PendingItem> g_itemQueue;
@@ -384,6 +384,7 @@ static Item g_items[] = {
     {MOVEMENT, "Low Gravity", TOGGLE, MAIN, &f_lowGravity},
     {MOVEMENT, "Save Spot", ACTION, MAIN, nullptr, SaveSpot},
     {MOVEMENT, "Go To Spot", ACTION, MAIN, nullptr, GoToSpot},
+    {MOVEMENT, "Arrow Hands", TOGGLE, MAIN, &f_arrows},
 
 
     {RIG, "Exit Rig Mods", OPEN, MAIN},
@@ -436,6 +437,7 @@ static const struct { const char *label, *tip; } kTips[] = {
     {"Low Gravity", "Jump higher, fall slower."},
     {"Save Spot", "Remembers where you are."},
     {"Go To Spot", "Teleports you to your saved spot."},
+    {"Arrow Hands", "Squeeze a trigger to shoot an arrow from that hand. Only you see them."},
     {"Change Menu Theme", "Blaze, Orange, Blue, Green, Purple, Dark."},
     {"Rainbow Menu", "The menu cycles through colors."},
     {"Show FPS", "Frames per second in the title."},
@@ -1390,6 +1392,101 @@ static void SpawnOnHandTick(const Buttons &in) {
     g_itemQueue.push_back({G.trGetPosition[hand]() + G.trGetForward[hand]() * 0.1f, Vector3(0, 0, 0)});
 }
 
+// ---- Arrow Hands ---------------------------------------------------------------
+// Squeeze a trigger to shoot an arrow out of that hand (left trigger = left hand, right
+// trigger = right hand). Local only: the arrows are plain objects in your own game.
+// Nothing is sent to the room and they don't push or hurt anyone. They fly in an arc,
+// stick into whatever they hit and disappear after a few seconds.
+struct Arrow { Ref shaft, tip; Vector3 pos, vel, dir; double dieAt; bool stuck; };
+static std::vector<Arrow> g_arrows;
+static bool g_arrowPrevL = false, g_arrowPrevR = false;
+static double g_nextArrowL = 0, g_nextArrowR = 0;
+static constexpr size_t kMaxArrows = 40;
+static const float kArrowSpeed = 25.0f;
+
+static void ClearArrows() {
+    for (auto &a : g_arrows) { Kill(a.shaft); Kill(a.tip); }
+    g_arrows.clear();
+}
+
+static void PlaceArrow(Arrow &a) {
+    Il2CppObject *s = a.shaft.get(), *t = a.tip.get();
+    if (!Alive(s) || !Alive(t)) return;
+    Quaternion q = Quaternion::LookRotation(a.dir);
+    Il2CppObject *st = Tr(s), *tt = Tr(t);
+    G.trSetRotation[st](q);
+    G.trSetPosition[st](a.pos - a.dir * 0.16f);      // 40 cm shaft, ending just behind the tip
+    G.trSetRotation[tt](q);
+    G.trSetPosition[tt](a.pos + a.dir * 0.06f);      // 8 cm head, its point at pos + 10 cm
+}
+
+static void ShootArrow(Il2CppObject *hand) {
+    if (!Alive(hand) || g_arrows.size() >= kMaxArrows) return;
+    Il2CppObject *s = Cube(Color(0.55f, 0.35f, 0.15f, 1), false);       // wooden shaft
+    Il2CppObject *t = Cube(Color(0.85f, 0.85f, 0.90f, 1), false);       // steel head
+    if (!s || !t) {
+        if (s) G.destroy(s);
+        if (t) G.destroy(t);
+        return;
+    }
+    G.trSetLocalScale[Tr(s)](Vector3(0.015f, 0.015f, 0.40f));
+    G.trSetLocalScale[Tr(t)](Vector3(0.050f, 0.050f, 0.08f));
+    Arrow a;
+    a.dir = G.trGetForward[hand]();
+    a.pos = G.trGetPosition[hand]() + a.dir * 0.15f;
+    a.vel = a.dir * kArrowSpeed;
+    a.dieAt = g_time + 8.0;
+    a.stuck = false;
+    a.shaft.set(s);
+    a.tip.set(t);
+    PlaceArrow(a);
+    g_arrows.push_back(a);
+}
+
+static void ArrowTick(const Buttons &in, float dt) {
+    bool fireL = in.ltrig && !g_arrowPrevL, fireR = in.rtrig && !g_arrowPrevR;
+    g_arrowPrevL = in.ltrig;
+    g_arrowPrevR = in.rtrig;
+    if (!f_arrows) {                                    // switched off: the arrows go away
+        if (!g_arrows.empty()) ClearArrows();
+        return;
+    }
+    if (!g_menuShown) {
+        if (fireL && g_time >= g_nextArrowL) { g_nextArrowL = g_time + 0.15; ShootArrow(g_leftHand.get()); }
+        if (fireR && g_time >= g_nextArrowR) { g_nextArrowR = g_time + 0.15; ShootArrow(g_rightHand.get()); }
+    }
+    // Arrows stop on the same layers your hands can climb (the world), not on players.
+    int mask = G.locomotionLayers.IsValid() && g_player.get() ? G.locomotionLayers[g_player.get()]() : -5;
+    if (!mask) mask = -5;
+    for (size_t i = 0; i < g_arrows.size();) {
+        Arrow &a = g_arrows[i];
+        if (g_time >= a.dieAt || !Alive(a.shaft.get()) || !Alive(a.tip.get())) {
+            Kill(a.shaft);
+            Kill(a.tip);
+            g_arrows.erase(g_arrows.begin() + i);
+            continue;
+        }
+        if (!a.stuck) {
+            a.vel.y -= 9.81f * 0.3f * dt;               // a gentle arc
+            float speed = sqrtf(Dot(a.vel, a.vel));
+            if (speed > 0.01f) {
+                a.dir = a.vel * (1.0f / speed);
+                float step = speed * dt;
+                BNM::Structures::Unity::RaycastHit hit{};
+                if (G.raycast.IsValid() && G.raycast(a.pos, a.dir, &hit, step, mask)) {
+                    a.pos = hit.point;                  // stuck in
+                    a.stuck = true;
+                    a.dieAt = fminf((float)a.dieAt, (float)g_time + 5.0f);
+                } else {
+                    a.pos = a.pos + a.vel * dt;
+                }
+            }
+        }
+        PlaceArrow(a);
+        i++;
+    }
+}
+
 // ---- callbacks ---------------------------------------------------------------
 
 static void OnRoomChange() {
@@ -1398,6 +1495,7 @@ static void OnRoomChange() {
     for (Ref *r : {&g_board, &g_bg, &g_outline, &g_title, &g_titleBar, &g_prev, &g_next, &g_notifyText, &g_tipText}) r->clear();
     for (Ref *r : {&g_menu, &g_pointer, &g_notifyGo, &g_leftPlatform, &g_rightPlatform, &g_gunBall, &g_gunLineGo}) Kill(*r);
     PauseTrackers(false);
+    ClearArrows();
     g_dancing = false;
     g_gunLine.clear();
     if (g_noclipOn && g_player.get()) {           // leaving the room mid-noclip: put things back
@@ -1453,6 +1551,7 @@ static void OnUpdate(float dt) {
     TeleportGunTick(in);
     try { SpawnOnHandTick(in); ItemQueueTick(); }
     catch (...) { g_itemQueue.clear(); ym::log("starter-menu: item code error"); }
+    ArrowTick(in, dt);
     DanceTick(in, dt);              // last: it moves your hands after everything else
 }
 
